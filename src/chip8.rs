@@ -67,18 +67,23 @@ impl Screen {
             println!("{}", line);
         }
     }
+
+    pub fn pixels(&self) -> &[bool] {
+        &self.pixels
+    }
 }
 
 pub struct Chip8 {
     memory: [u8; MEMORY_SIZE],
     register: [u8; 16],
-    i: u16, // store memory addresses
+    i: u16,  // store memory addresses
     pc: u16, // program counter => currently executing address
     stack: [u16; 16],
     sp: u8, // stack pointer => point to the topmost level of the stack
     delay_timer: u8,
     sound_timer: u8,
     screen: Screen, // 64x32
+    keys: [bool; 16],
 }
 
 #[derive(Debug)]
@@ -101,9 +106,10 @@ impl Chip8 {
             delay_timer: 0,
             sound_timer: 0,
             screen: Screen::new(),
+            keys: [false; 16],
         }
     }
-    
+
     pub fn screen(&self) -> &Screen {
         &self.screen
     }
@@ -115,9 +121,17 @@ impl Chip8 {
                 max_size: MAX_ROM_SIZE,
             });
         }
-        self.memory[START_ADDR..START_ADDR + rom.len()]
-            .copy_from_slice(rom);
+        self.memory[START_ADDR..START_ADDR + rom.len()].copy_from_slice(rom);
         Ok(())
+    }
+
+    pub fn tick_timers(&mut self) {
+        if self.delay_timer > 0 {
+            self.delay_timer -= 1;
+        }
+        if self.sound_timer > 0 {
+            self.sound_timer -= 1;
+        }
     }
 
     pub fn draw_sprite(&mut self, x: u8, y: u8, n: u8) {
@@ -147,6 +161,10 @@ impl Chip8 {
         }
     }
 
+    pub fn set_key(&mut self, key: usize, pressed: bool) {
+        self.keys[key] = pressed;
+    }
+
     pub fn fetch(&self) -> u16 {
         let pc_index = self.pc as usize;
         ((self.memory[pc_index] as u16) << 8) | self.memory[pc_index + 1] as u16
@@ -155,20 +173,131 @@ impl Chip8 {
     pub fn execute(&mut self, instr: Instruction) {
         match instr {
             Instruction::Clear => self.screen.clear(),
+            Instruction::Return => {
+                self.sp -= 1;
+                self.pc = self.stack[self.sp as usize];
+            }
             Instruction::Jump(nnn) => self.pc = nnn,
-            Instruction::PutVx {x, kk} => self.register[x as usize] = kk,
+            Instruction::Call(nnn) => {
+                self.stack[self.sp as usize] = self.pc;
+                self.sp += 1;
+                self.pc = nnn;
+            },
+            Instruction::SkipIfVxEqualKK { x, kk } => if self.register[x as usize] == kk { self.pc += 2 },
+            Instruction::SkipIfVxNotEqualKK { x, kk } => if self.register[x as usize] != kk { self.pc += 2 },
+            Instruction::SkipIfVxEqualVy { x, y } => if self.register[x as usize] == self.register[y as usize] { self.pc += 2 },
+            Instruction::PutVx { x, kk } => self.register[x as usize] = kk,
+            Instruction::AddVx {x, kk } => self.register[x as usize] = self.register[x as usize].wrapping_add(kk),
+            Instruction::SetVxToVy { x, y } => self.register[x as usize] = self.register[y as usize],
+            Instruction::OrVxVy { x, y } => {
+                self.register[x as usize] |= self.register[y as usize];
+                self.register[0xF] = 0;
+            }
+            Instruction::AndVxVy { x, y } => {
+                self.register[x as usize] &= self.register[y as usize];
+                self.register[0xF] = 0;
+            }
+            Instruction::XorVxVy { x, y } => {
+                self.register[x as usize] ^= self.register[y as usize];
+                self.register[0xF] = 0;
+            }
+            Instruction::AddVxVy { x, y } => {
+                let vx = self.register[x as usize];
+                let vy = self.register[y as usize];
+                let (result, carry) = vx.overflowing_add(vy);
+                self.register[x as usize] = result;
+                self.register[0xF] = carry as u8;
+            }
+            Instruction::SubVxVy { x, y } => {
+                let vx = self.register[x as usize];
+                let vy = self.register[y as usize];
+                let (result, borrow) = vx.overflowing_sub(vy);
+                self.register[x as usize] = result;
+                self.register[0xF] = (!borrow) as u8;
+            }
+            Instruction::ShiftRight { x, y } => {
+                let vy = self.register[y as usize];
+                let bit_out = vy & 1;
+                self.register[x as usize] = vy >> 1;
+                self.register[0xF] = bit_out;
+            }
+            Instruction::SubnVyVx { x, y } => {
+                let vx = self.register[x as usize];
+                let vy = self.register[y as usize];
+                let (result, borrow) = vy.overflowing_sub(vx);
+                self.register[x as usize] = result;
+                self.register[0xF] = (!borrow) as u8;
+            }
+            Instruction::ShiftLeft { x, y } => {
+                let vy = self.register[y as usize];
+                let bit_out = (vy >> 7) & 1;
+                self.register[x as usize] = vy << 1;
+                self.register[0xF] = bit_out;
+            }
+            Instruction::SkipIfVxNotEqualVy { x, y } => if self.register[x as usize] != self.register[y as usize] { self.pc += 2 },
             Instruction::SetI(nnn) => self.i = nnn,
+            Instruction::JumpPlusV0(nnn) => self.pc = nnn + self.register[0] as u16,
+            Instruction::Random { x, kk } => self.register[x as usize] = rand::random::<u8>() & kk,
             Instruction::Display { x, y, n } => self.draw_sprite(x, y, n),
-            Instruction::Unknown(value) => { panic!("unknown upcode : {:04x}", value) }
+            Instruction::SkipIfKeyPressed(x) => {
+                let key = self.register[x as usize] as usize;
+                if self.keys[key] {
+                    self.pc += 2;
+                }
+            }
+            Instruction::SkipIfKeyNotPressed(x) => {
+                let key = self.register[x as usize] as usize;
+                if !self.keys[key] {
+                    self.pc += 2;
+                }
+            },
+            Instruction::WaitForKeyPressed(x) => {
+                match self.keys.iter().position(|&pressed| pressed) {
+                    Some(k) => self.register[x as usize] = k as u8,
+                    None => self.pc -= 2,
+                }
+            },
+            Instruction::AddToI(x) => self.i = self.i.wrapping_add(self.register[x as usize] as u16),
+            Instruction::SetVxToDelay(x) => self.register[x as usize] = self.delay_timer,
+            Instruction::SetDelayToVx(x) => self.delay_timer = self.register[x as usize],
+            Instruction::SetSoundToVx(x) => self.sound_timer = self.register[x as usize],
+            Instruction::SetIToFont(x) => {
+                let digit = (self.register[x as usize] & 0xF) as usize;
+                self.i = (FONTSET_START_ADDRESS + digit * 5) as u16;
+            },
+            Instruction::StoreBcd(x) => {
+                let vx = self.register[x as usize];
+                let i = self.i as usize;
+                self.memory[i] = vx / 100;
+                self.memory[i + 1] = (vx / 10) % 10;
+                self.memory[i + 2] = vx % 10;
+            }
+            Instruction::StoreRegisters(x) => {
+                let i = self.i as usize;
+                for r in 0..=x as usize {
+                    self.memory[i + r] = self.register[r];
+                }
+                self.i += x as u16 + 1;
+            }
+            Instruction::LoadRegisters(x) => {
+                let i = self.i as usize;
+                for r in 0..=x as usize {
+                    self.register[r] = self.memory[i + r];
+                }
+                self.i += x as u16 + 1;
+            }
+            Instruction::Unknown(value) => {
+                panic!("unknown upcode : {:04x}", value)
+            }
         }
     }
-    
+
     pub fn step(&mut self) {
         let op_code = self.fetch();
         self.pc += 2;
-        
+
         let instr = Instruction::decode(op_code);
-        
+
         self.execute(instr);
     }
 }
